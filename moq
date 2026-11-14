@@ -69,6 +69,17 @@ win_path() {
     fi
 }
 
+# A path inside a TOML basic string. On Windows, cygpath -m (`D:/...`), never cygpath -w:
+# a backslash in `"D:\test\..."` is a TOML escape (`\t` is a tab). cargo.exe reads `/d/...`
+# as `D:\d\...` and does not find the crate.
+toml_path() {
+    if moq_on_windows && command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
 # An argument for moqui.exe. Git Bash converts a bare absolute path when it starts a program, and
 # leaves `location=/d/...` alone because the argument does not start with `/`.
 win_arg() {
@@ -333,6 +344,27 @@ ensure_nasm() {
     local script=$ROOT/scripts/nasm.sh dir
     [ -f "$script" ] || die "missing $(rel "$script")"
     dir=$("$script" ensure | tr -d '\r') || die "could not get NASM"
+    [ -n "$dir" ] || return 0
+    export PATH="$dir:$PATH"
+}
+
+# cef-dll-sys runs cmake with the Ninja generator. On Windows, download a pinned CMake once
+# (scripts/cmake.sh) when none is on PATH, and prepend its bin. A dry run prints the curl and does not download.
+# MOQUI_CMAKE, a directory or cmake.exe, is used as it is. Linux and macOS keep the cmake on PATH.
+ensure_cmake() {
+    local script=$ROOT/scripts/cmake.sh dir
+    [ -f "$script" ] || die "missing $(rel "$script")"
+    dir=$("$script" ensure | tr -d '\r') || die "could not get CMake"
+    [ -n "$dir" ] || return 0
+    export PATH="$dir:$PATH"
+}
+
+# The same build needs ninja. On Windows, download a pinned Ninja once (scripts/ninja.sh) when none is on PATH.
+# A dry run prints the curl and does not download. MOQUI_NINJA, a directory or ninja.exe, is used as it is.
+ensure_ninja() {
+    local script=$ROOT/scripts/ninja.sh dir
+    [ -f "$script" ] || die "missing $(rel "$script")"
+    dir=$("$script" ensure | tr -d '\r') || die "could not get Ninja"
     [ -n "$dir" ] || return 0
     export PATH="$dir:$PATH"
 }
@@ -1021,6 +1053,8 @@ version, from cargo:
     cargo install tauri-cli --version 3.0.0-alpha.5 --locked
 
 The first build downloads CEF (about 1 GB) into the tauri-cef cache (CEF_PATH to use another).
+On Windows it also downloads CMake and Ninja into %USERPROFILE%\.moqui when they are not on PATH
+(MOQUI_CMAKE and MOQUI_NINJA to use another). The C++ compiler is still Visual Studio Build Tools.
 dev runs on this repository's runtime (MOQUI_RUNTIME to use another); a bundled app keeps its
 runtime in the app data directory. See crates/moqui-desktop/README.md.
 
@@ -1513,8 +1547,9 @@ write_if_changed() {
 # are optional dependencies that the devtools feature turns on. Its Cargo.lock starts from the repository's, so the
 # reviewed versions stay and only the component crates' own dependencies are added.
 write_app_crate() {
-    local app=$1 dir package deps="" uses="" unoptimized="" crate tui_features= devtools_features=
+    local app=$1 dir package deps="" uses="" unoptimized="" crate tui_features= devtools_features= dir_toml root_toml
     shift
+    root_toml=$(toml_path "$ROOT")
     local -a dirs
     while IFS= read -r dir; do dirs+=("$dir"); done < <(component_crate_dirs "$ROOT/runtime/base-component")
     while IFS= read -r dir; do
@@ -1525,14 +1560,15 @@ write_app_crate() {
         package=$(crate_package_name "$dir")
         [ -n "$package" ] || die "$(rel "$dir")/Cargo.toml has no [package] name"
         unoptimized+=$'\n'"[profile.dev.package.$package]"$'\n'"opt-level = 0"$'\n'"debug = true"$'\n'
+        dir_toml=$(toml_path "$dir")
         case $dir in
             "$ROOT/runtime/dev-component/"*)
-                deps+="$package = { path = \"$dir\", optional = true }"$'\n'
+                deps+="$package = { path = \"$dir_toml\", optional = true }"$'\n'
                 devtools_features+=", \"dep:$package\""
                 uses+="#[cfg(feature = \"devtools\")]"$'\n'"use ${package//-/_} as _;"$'\n'
                 ;;
             *)
-                deps+="$package = { path = \"$dir\" }"$'\n'
+                deps+="$package = { path = \"$dir_toml\" }"$'\n'
                 uses+="use ${package//-/_} as _;"$'\n'
                 ;;
         esac
@@ -1580,8 +1616,8 @@ tui = [\"moqui-host/tui\"${tui_features}]
 devtools = [\"moqui-host/devtools\"${devtools_features}]
 
 [dependencies]
-moqui-host = { path = \"$ROOT/crates/moqui-host\", default-features = false }
-moqui-core = { path = \"$ROOT/crates/moqui-core\", default-features = false }
+moqui-host = { path = \"$root_toml/crates/moqui-host\", default-features = false }
+moqui-core = { path = \"$root_toml/crates/moqui-core\", default-features = false }
 ${deps}
 # The global allocator, as crates/moqui has it (src/main.rs); not on MSVC.
 [target.'cfg(not(target_env = \"msvc\"))'.dependencies]
@@ -1722,6 +1758,11 @@ task_desktop() {
         shift
     done
     need_tauri_cli
+    # CMake and Ninja build CEF's C++ wrapper. On Windows they are downloaded when missing (scripts/cmake.sh,
+    # scripts/ninja.sh). Elsewhere they have to be on PATH; the C++ compiler is never fetched.
+    ensure_cmake
+    ensure_ninja
+    moq_on_windows || need_tool cmake ninja
     ensure_pg_archive
     # The component crates, as build_binary finds them; the generated crate is written even when there are none.
     local -a addons
@@ -1755,6 +1796,10 @@ task_desktop() {
     fi
     # The repository's target directory, so the framework crates are built once for the server and the app.
     export_var CARGO_TARGET_DIR "$ROOT/target"
+    # The app's download-cef is its patched copy, whose catalog fetch allows a body over ureq's 10 MB
+    # (crates/moqui-desktop/patches/README.md): a cef-dll-sys update that the patch no longer matches fails here,
+    # never downloads with the capped read_json.
+    desktop_download_cef_patched "$app"
     if [ "$command" = build ] && [ "$(uname -s)" = Linux ]; then
         # The Linux bundles copy libEGL.so and libGLESv2.so from the CEF distribution, which no longer has them, so
         # the bundle step runs on a staged distribution (stage_desktop_cef). The build keeps the CEF_PATH it has, so
@@ -1777,6 +1822,25 @@ task_desktop() {
     fi
     (cd "$app" && run_cmd cargo tauri "$command" ${tauri_args[@]+"${tauri_args[@]}"} -- ${cargo_args[@]+"${cargo_args[@]}"}) \
         || die "cargo tauri $command failed"
+}
+
+# download-cef must be the patched copy (crates/moqui-desktop/patches/README.md): the published 3.0.0 reads the CEF
+# catalog with ureq's 10 MB JSON cap, and the catalog is larger.
+desktop_download_cef_patched() {
+    local tree line
+    dry_run && return 0
+    # A build dependency of cef-dll-sys (cargo's default edges; -e normal finds nothing). Cargo on Windows
+    # prints backslashes, so they are normalized before the path check.
+    tree=$(cd "$1" && cargo tree -i download-cef --depth 0 2>/dev/null | sed 's|\\|/|g') \
+        || die "cargo tree -i download-cef failed in $(rel "$1"): is download-cef still a dependency of the app?"
+    [ -n "$tree" ] || die "no download-cef in the dependency tree of $(rel "$1")"
+    while IFS= read -r line; do
+        case $line in
+            "download-cef v"*"/patches/download-cef)"*) ;;
+            "download-cef v"*) die "the desktop app's download-cef is not its patched copy ($line): port patches/download-cef to it" \
+                "(crates/moqui-desktop/patches/README.md)" ;;
+        esac
+    done <<<"$tree"
 }
 
 # The emulator's AVD and the API of the system image it is made from (with Play services, for FCM).

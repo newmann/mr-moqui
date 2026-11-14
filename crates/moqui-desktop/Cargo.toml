@@ -73,8 +73,13 @@ close_fds = "0.3"
 [build-dependencies]
 tauri-build = { version = "=3.0.0-alpha.4", features = [] }
 
-# Its own workspace: not a member of the repository's.
+# Its own workspace: not a member of the repository's. The patched crates are not members.
 [workspace]
+exclude = ["patches"]
+
+# download-cef with a catalog fetch that allows a body over ureq's 10 MB (patches/README.md).
+[patch.crates-io]
+download-cef = { path = "patches/download-cef" }
 
 # As in the repository's workspace and target/moqui-app: a debug build leaves the framework and component crates at
 # opt-level 0 with full debug info and optimizes the other dependencies (.cargo/config.toml). Here they are not

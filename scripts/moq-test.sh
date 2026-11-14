@@ -206,6 +206,42 @@ check "failed build" 1 'cargo build failed' -- env CARGO_STUB_FAIL=1 "$M" load
 "$R/bin/cargo" build --profile release -p moqui
 rm -f "$R/cargo.log"
 
+# A component crate makes ./moq build write target/moqui-app. On Windows the path in that Cargo.toml is a
+# forward-slash drive path (D:/...), which cargo.exe can open. A Git Bash /d/... path is not: cargo.exe looks
+# for D:\d\... and does not find the crate. Removed afterwards so later builds stay on -p moqui.
+addon=$R/runtime/component/path-shop
+mkdir -p "$addon"
+printf '<component/>\n' >"$addon/component.xml"
+printf '[package]\nname = "path-shop"\nversion = "0.1.0"\nedition = "2021"\n' >"$addon/Cargo.toml"
+# The fixture has no scripts/nasm.sh, and write_app_crate copies the repository lock. An empty lock
+# is enough: the cargo stub does not read it. MOQ_NASM_CHECKED skips the fetch only for this build.
+printf '\n' >"$R/Cargo.lock"
+rm -f "$R/cargo.log"
+check "component crate build" 0 'Linking component crate path-shop' -- env MOQ_NASM_CHECKED=1 "$M" build
+check "component crate build uses the generated manifest" 0 'manifest-path' -- cat "$R/cargo.log"
+host_path=$R/crates/moqui-host
+case $(uname -s) in
+    MINGW*|MSYS*|CYGWIN*) host_path=$(cygpath -m "$host_path") ;;
+esac
+if grep -F "path = \"$host_path\"" "$R/target/moqui-app/Cargo.toml" >/dev/null; then
+    ok
+else
+    bad "generated moqui-host path is $host_path" "$(cat "$R/target/moqui-app/Cargo.toml")"
+fi
+case $(uname -s) in
+    MINGW*|MSYS*|CYGWIN*)
+        if [ ! -f "$R/target/moqui-app/Cargo.toml" ]; then
+            bad "generated Cargo.toml is missing"
+        elif grep -Eq 'path = "/[A-Za-z]/' "$R/target/moqui-app/Cargo.toml"; then
+            bad "generated Cargo.toml has an MSYS drive path" "$(grep 'path =' "$R/target/moqui-app/Cargo.toml")"
+        else
+            ok
+        fi
+        ;;
+esac
+rm -rf "$addon"
+rm -f "$R/Cargo.lock" "$R/cargo.log"
+
 # sccache as the rustc wrapper, opt-in with MOQ_SCCACHE=1: a stub sccache on the PATH, a cargo home of its own, and
 # no wrapper from the caller.
 mkdir -p "$FIX/sccache-bin" "$FIX/cargo-home"
